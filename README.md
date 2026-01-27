@@ -1,22 +1,39 @@
-- `vsp500gp.py`と`README.md`はほとんどCodexが書いたものです。
-- 暇つぶしなので内容や精度は一切保証しません。YouTube等でインフルエンサーのコンテンツを見たほうがいいと思います。
+
+`vgp.py` は、投資信託 **Tracers [S&P500|NASDAQ100] ゴールドプラス** の基準価額を、日次でシミュレーションするスクリプトです。
+
+# 前提
+
+- `vgp.py`と`README.md`はほとんどCodexが書いたものです。暇つぶしなので内容や精度は一切保証しません。細かいことは無視してるので、上方にドリフトしてる気がします。
+- YouTube等で似たようなことをしてるインフルエンサーがいるので、そちらをを見たほうがいいと思います。
 - 改善点があれば教えてもらえるとうれしいです。
-- データは提供元（TradingView、指数提供会社、銀行等）の利用規約に従いましょう。CSVファイルや二次加工データを他人に提供するのはダメだと思います。
+- データは提供元（TradingView、指数提供会社、銀行等）の利用規約に従いましょう。CSVファイルを他人に提供するのはダメだと思います。
+- 気が向いたら、もうちょっと改善するかも
 
 
-# Tracers S&P500ゴールドプラス基準価額シミュレーション
+# ソース・データ
 
-`vsp500gp.py` は、投資信託 **Tracers S&P500ゴールドプラス** の基準価額を、日次でシミュレーションするスクリプトです。 \
-以下のデータはTradingViewからのCSVファイルダウンロードなどで取得することを想定しています。 \
-(データの第三者への共有は規約違反なのでやりません)
+使用したデータは以下です。面倒なので dateの形式は YYYY-MM-DD だけの対応です。桁区切りのカンマにも対応していません。細かいことはコード参照。
 
-- 株式：S&P500（価格指数 SPX と配当込み指数 SPXTR）
-- 金：Bloomberg Gold Subindex（BCOMGC：Excess Return）
-- 為替：三菱UFJ銀行の USD/JPY TTM（仲値）などドル円データ
+- 株式（価格指数 + 配当込み指数(税引前)）
+  - SPX, SPXTR: TradingViewからダウンロード
+  - NDX: https://indexes.nasdaqomx.com/Index/History/NDX (Excelを日付降順にソートしてCSVにexport)
+  - XNDX: https://indexes.nasdaqomx.com/Index/History/XNDX (同上)
+- Bloomberg Gold Subindex（BCOMGC：Excess Return）: TradingViewからダウンロード
+- 為替：三菱UFJ R&C の USD/JPY TTM（仲値）を CSVに加工したもの
   - 例: https://www.murc-kawasesouba.jp/fx/past_3month.php
-- 実績：ファンドの基準価額（CSV）
-  - https://www.amova-am.com/fund/detail/645066 から取得
+- ゴールドプラス実績データ：ファンドの基準価額（CSV）
+  - https://www.amova-am.com/fund/detail/645066
+  - https://www.amova-am.com/fund/detail/645133
+
 ---
+
+# モードの切り替え
+
+`vgp.py` の `stock` 変数を変更すると S&P500 or NASDAQ100 を変更できます。
+
+```python
+stock = "SP500" # "SP500" (ゴルプラ) or "NASDAQ100" (ゴルナス) を指定する
+```
 
 # 生成されたCSVデータの参照
 
@@ -34,6 +51,7 @@ TradingView Lightweight Chartsで作ってます。普通の正規化チャー�
 S&P500の価格指数（PR）とトータルリターン指数（TR）から配当成分を抽出し、
 配当税率（既定：10%）を掛けて、税引後に近い日次リターンを作ります。
 
+例:
 - `SPXTR`（TR）と `SPX`（PR）の差分 → 配当由来リターンとみなす
 - 配当税率 `DIV_TAX_RATE` を適用して **疑似Net TR** を構成
 
@@ -42,15 +60,23 @@ S&P500の価格指数（PR）とトータルリターン指数（TR）から配�
 BCOMGCは金先物のロール等を反映する（Excess Return）指数です。
 本スクリプトでは金のドル建て日次リターンを `pct_change()` で計算します。
 
-### 3) USD/JPYは「翌営業日のTTM」を適用する前提
+### 3) 基準価額は「日本の平日（TTMがある日）だけ」算出する
 
-米国市場の終値（資産価格）に対し、日本側のTTM（午前公表）を用いて円換算するため、
-**資産日 t に対して t+1日以降で最初に存在するTTM** を forward で結合します。
+Tracersの基準価額（NAV）が公表されるのは日本の平日だけ、という前提に合わせて、
+**出力（NAVを計算する日付）を MUFG TTM が存在する日付に限定**します。
 
-この結合は `align_assets_with_next_day_fx()` で実装しています（`pd.merge_asof(..., direction='forward')`）。
+具体的には、次のルールで「資産（米国市場日）」と「TTM（日本日付）」を整列します。
+
+- 出力カレンダー：`MUFG_USD_TTM.csv` にレートが存在する日付（= 日本営業日を近似）
+- 各日本営業日 `d` に対して、資産価格は「`d` より前の直近の米国市場日（`asset_date < d`）」の終値を使用
+- その資産水準（株・金）を `d` のTTMで円評価してNAVを算出
+
+この結合は `align_assets_to_fx_calendar()` で実装しています（`pd.merge_asof(..., direction='backward', allow_exact_matches=False)`）。
 
 > これは “look-ahead（未来値混入）” を避けつつ、
-> 「米国市場の値動き → 翌営業日のTTMで円評価」という想定を再現するための実装です。
+> 「（日本が休みの間に進んだ）米国市場の値動き → 次の日本営業日のTTMで円評価」
+> という想定を日付ベースで再現するための実装です。
+
 
 ### 4) 金の為替適用は3モード
 
@@ -69,11 +95,16 @@ BCOMGCは金先物のロール等を反映する（Excess Return）指数です�
 
 スクリプト先頭で以下のファイル名を参照しているので、環境に応じて変更してください。
 
-- `SP_SPXTR_1D.csv` : S&P500 TR（配当込み）日次
-- `CBOE_DLY_SPX_1D.csv` : S&P500 PR（価格指数）日次
+- （S&P500モードの場合の例）
+  - `SP_SPXTR_1D.csv` : S&P500 TR（配当込み）日次
+  - `CBOE_DLY_SPX_1D.csv` : S&P500 PR（価格指数）日次
+- （NASDAQ100モードの場合の例）
+  - `NASDAQ_XNDX.csv` : NASDAQ-100 TR（XNDX）日次
+  - `NASDAQ_NDX.csv` : NASDAQ-100 PR（NDX）日次
 - `BBG_BCOMGC_1D.csv` : BCOMGC（Gold Excess Return）日次
 - `MUFG_USD_TTM.csv` : USD/JPY TTM 日次
-- `fund_info_645066_202601220907.csv` : ファンド実績NAV
+- `fund_info_645066_202601220907.csv` など: ファンド実績NAV
+  - NASDAQ100（ゴルナス）の場合は `fund_info_645133_...csv`
 
 > いずれもCSV列名揺れをある程度吸収するロジックが入っています。
 > ただし、TradingViewエクスポート形式を想定しているため、列名が大きく異なる場合は調整が必要です。
@@ -83,12 +114,12 @@ BCOMGCは金先物のロール等を反映する（Excess Return）指数です�
 ## 使い方
 
 ```bash
-python3 vsp500gp.py
+python3 vgp.py
 ```
 
 実行すると、デフォルトで以下のCSVが出力されます。
 
-- `sim_tracers_sp500_goldplus_nav.csv`
+- `sim_tracers_[sp500|nasdaq100]_goldplus_nav.csv`
   - `nav`（シミュレーションNAV）
   - `r_eq_jpy`（株式円建て日次リターン）
   - `r_gold_jpy`（金円建て日次リターン）
@@ -173,17 +204,21 @@ python3 vsp500gp.py
 このため、単純に「同じ日付」で資産価格とTTMを結合すると、時間順序が逆転することがあります（例：日本時間午前のTTMを、同日の米国終値の評価に使ってしまう）。
 
 **本コードの前提（採用している近似）**
-- 資産価格の「日付」は米国市場の終値日（US Market Day）
-- 基準価額の円換算は、その米国市場日の値動きを受けた後、**日本側の翌営業日に決まるTTMで円換算**する
 
-そのため、資産日 *t* に対し **t+1日以降で最初に存在するTTM** を適用するようにしています。
-これを実装しているのが `align_assets_with_next_day_fx()` で、`merge_asof(..., direction='forward')` を使い forward（未来方向）でFXを結合します。
+- 基準価額（NAV）を出力する日付は「日本の平日（= TTMが存在する日）」のみ
+- 各日本営業日 `d` に対し、資産価格は「`d` より前の直近の米国市場日（`asset_date < d`）」の終値を使う
+- その資産水準を、日本営業日 `d` のTTMで円換算する
+
+これを実装しているのが `align_assets_to_fx_calendar()` で、`merge_asof(..., direction='backward', allow_exact_matches=False)` により
+**`asset_date < fx_date` を満たす直近の終値**を結合します。
+
+
 
 **例**
 
-- 2024-01-10（米国市場日 t）の終値が確定（日本時間だと 2024-01-11 早朝）
-- 2024-01-11（日本側の翌営業日）午前にTTMが公表
-- よって「2024-01-10 の米国終値」を円換算するのに使うTTMは「2024-01-11」
+- 2024-01-10（米国市場日）の終値が確定（日本時間だと 2024-01-11 早朝）
+- 2024-01-11（日本営業日）午前にTTMが公表
+- よって「直近の米国終値（2024-01-10）」を「日本営業日（2024-01-11）のTTM」で円換算し、その日付でNAVを出力する
 
 このような想定を、日付ベースで実現しています。
 
@@ -242,10 +277,10 @@ python3 vsp500gp.py
 
 2. **為替適用タイミングは仮定**
 
-   米国市場終値を翌営業日TTMで評価する前提を採用しています。
-   実際の算定規則と厳密一致する保証はありません。
+- 米国市場の直近終値（日本営業日より前の終値）を、日本営業日のTTMで評価する前提を採用しています。
+- 実際の算定規則（約定・算定の締時刻等）と厳密一致する保証はありません。
 
-3. **CSV形式が異なる場合は読み込み処理の調整が必要**
+1. **CSV形式が異なる場合は読み込み処理の調整が必要**
 
    `load_tradingview_csv()` / `load_mufg_ttm_csv()` は列名推定を行いますが、
    想定と違う形式だと例外が発生することがあります。
@@ -261,7 +296,14 @@ python3 vsp500gp.py
 CSV内の日付列名が想定と違う可能性があります。
 `load_tradingview_csv()` の date列候補（`time/date/datetime`）を追加するなどの対処が必要です。
 
-### FXが結合できない（末尾が欠ける）
-`align_assets_with_next_day_fx()` は「資産日 + 1日」以降でFXが見つからない場合、
-その行を落とします（末尾数行が削除されることがあります）。
+### FX/資産が結合できない（NaNが出る）
+
+`align_assets_to_fx_calendar()` は「日本営業日 `d` に対して `d` より前の直近の米国市場日」を結合します。
+そのため以下の場合にNaNが出て、後段の `dropna()` で行が落ちることがあります。
+
+- 分析期間の先頭付近：`d` より前の資産データがまだ存在しない
+- 為替TTM側に欠落がある（※TTM欠落は別途対応する想定なら、TTM側の整備が必要）
+- 米国休場が長期に続いた等で、`tolerance`（既定例：7日）を超えてマッチできない
+
+必要なら `tolerance` を緩めるか、欠落期間のデータ整備を行ってください。
 

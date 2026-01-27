@@ -4,6 +4,7 @@
 import pandas as pd
 import numpy as np
 from pathlib import Path
+import sys
 
 # =========================
 # 設定
@@ -11,17 +12,31 @@ from pathlib import Path
 
 DATA_DIR = Path("./")
 
-CSV_SPXTR = DATA_DIR / "SP_SPXTR_1D.csv"
-CSV_SPX   = DATA_DIR / "CBOE_DLY_SPX_1D.csv"
+stock = "SP500" # "SP500" (ゴルプラ) or "NASDAQ100" (ゴルナス) を指定する
+
+if stock == "SP500" :  # ゴルプラ
+    CSV_SPXTR = DATA_DIR / "SP_SPXTR_1D.csv"
+    CSV_SPX   = DATA_DIR / "CBOE_DLY_SPX_1D.csv"
+    CSV_FUND  = DATA_DIR / "fund_info_645066_202601261425.csv"  # ゴルプラ CSVファイルを指定 (評価フィイルを作成する場合)
+    BASE_DATE = "2022-08-31"   # ゴルプラ設定日基準（実績CSVに合わせる）
+    TER_ANNUAL = 0.0025        # 総経費率 0.25%/年（運用報告書の総経費率）
+    out_csv = DATA_DIR / "sim_tracers_sp500_goldplus_nav.csv"
+elif stock == "NASDAQ100" :  # ゴルナス
+    CSV_SPXTR = DATA_DIR / "NASDAQ_XNDX.csv"
+    CSV_SPX   = DATA_DIR / "NASDAQ_NDX.csv"
+    CSV_FUND  = DATA_DIR / "fund_info_645133_202601261425.csv"  # ゴルナス CSVファイルを指定 (評価フィイルを作成する場合)
+    BASE_DATE = "2025-01-24"   # ゴルナス設定日基準（実績CSVに合わせる）
+    TER_ANNUAL = 0.0027        # 総経費率 0.27%/年（運用報告書の総経費率）
+    out_csv = DATA_DIR / "sim_tracers_nasdaq100_goldplus_nav.csv"
+else :
+    print('株式の指定間違い')
+    sys.exit()
+
 CSV_GOLD  = DATA_DIR / "BBG_BCOMGC_1D.csv"
 CSV_FX    = DATA_DIR / "MUFG_USD_TTM.csv"
-CSV_FUND  = DATA_DIR / "fund_info_645066_202601220907.csv"
 
-BASE_DATE = "2022-08-31"   # 設定日基準（実績CSVに合わせる）
 BASE_NAV  = 10000.0
-
 DIV_TAX_RATE = 0.10        # 配当課税率（近似）
-TER_ANNUAL = 0.0025        # 総経費率 0.25%/年（運用報告書の総経費率）
 TRADING_DAYS = 252         # 日次控除用（投信の営業日を想定）
 
 # 金（BCOMGC）の為替適用モード
@@ -42,16 +57,17 @@ def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def load_tradingview_csv(path: Path, value_col_candidates=("close", "adj close", "value")) -> pd.Series:
+def load_tradingview_csv(path: Path, value_col_candidates=("close", "Close", "adj close", "value", "Index Value")) -> pd.Series:
     """
     TradingView export系CSVを読み、DatetimeIndexのSeries（終値）を返す。
+    NASDAQ公式サイトからダウンロードしたExcelをCSVに変換する場合は、事前に桁区切りカンマを除去して日付を昇順にソートする
     """
     df = pd.read_csv(path)
     df = _normalize_columns(df)
 
     # date/datetime列名候補
     date_col = None
-    for c in ("time", "date", "datetime"):
+    for c in ("time", "date", "datetime", "trade date"):
         if c in df.columns:
             date_col = c
             break
@@ -178,6 +194,48 @@ def align_assets_with_next_day_fx(df_assets: pd.DataFrame, fx: pd.Series) -> pd.
     merged = merged.dropna(subset=["usdjpy"]).set_index("asset_date")
     merged = merged.drop(columns=["target_date"])
 
+    return merged
+
+
+def align_assets_to_fx_calendar(df_assets: pd.DataFrame, fx: pd.Series) -> pd.DataFrame:
+    """日本の平日（= MUFG TTM が存在する日）だけ基準価額を算出するための整列。
+
+    目的：
+      - 出力インデックスを FX（TTM）の日付（日本営業日）に揃える
+      - 各 FX 日付 d に対して、未来値混入を避けるため「d より前の直近の米国市場日」の資産水準を使用する
+        (asset_date < fx_date の strict 過去参照)
+
+    これにより：
+      - 週末/祝日（日本休日）をまたいでも、FXがある日だけ出力できる
+      - 米国休場日があっても、直近の米国終値を保持しつつ、その日のTTMで評価できる
+    """
+    if not isinstance(df_assets.index, pd.DatetimeIndex):
+        raise TypeError("df_assets index must be DatetimeIndex")
+
+    assets = df_assets.sort_index().copy()
+    assets = assets.ffill()
+    assets = assets.reset_index().rename(columns={df_assets.index.name or "index": "asset_date"})
+    fx_clean = fx.sort_index()
+    fx_clean = fx_clean[~fx_clean.index.duplicated(keep="last")]
+    fx_clean = fx_clean.dropna()
+    fx_df = (
+        fx_clean.rename("usdjpy")
+        .to_frame()
+        .reset_index()
+        .rename(columns={fx_clean.index.name or "index": "fx_date"})
+    )
+    merged = pd.merge_asof(
+        fx_df.sort_values("fx_date"),
+        assets.sort_values("asset_date"),
+        left_on="fx_date",
+        right_on="asset_date",
+        direction="backward",
+        allow_exact_matches=False,              # asset_date < fx_date を保証（同日を使わない）
+        tolerance=pd.Timedelta(days=7),         # 長期ギャップは落とす（欠落対応は別途）
+    )
+
+    merged = merged.set_index("fx_date")
+    merged = merged.drop(columns=["asset_date"])
     return merged
 
 
@@ -386,8 +444,9 @@ def main():
         "bcomgc": gold,
     }, axis=1).sort_index()
 
-    # Align FX: apply next-business-day (Japan) TTM to each US market day.
-    df = align_assets_with_next_day_fx(df_assets, fx)
+    # 日本の平日（TTMがある日）だけ基準価額を算出する：
+    # FX（TTM）の日付をカレンダーとして、直近の米国終値（asset_date < fx_date）を結合する。
+    df = align_assets_to_fx_calendar(df_assets, fx)
 
     # 最古日付（全系列揃う地点）
     df = df.dropna()
@@ -395,18 +454,19 @@ def main():
     # シミュレーション
     sim = simulate_nav(df)
 
-    # 実績読み込み
-    fund_nav = load_fund_nav_csv(CSV_FUND)
+    # 実績読み込み (検証ファイルを作成する場合に必要)
+    # fund_nav = load_fund_nav_csv(CSV_FUND)
 
-    # 評価（共通期間）
+    # 評価（シミュレーションNAVと実績NAVを突合して誤差指標を算出）
     # eval_df = evaluate(sim, fund_nav)
 
     # 保存
-    out_csv = DATA_DIR / "sim_tracers_sp500_goldplus_nav.csv"
+    # out_csv のファイル名はこのスクリプトの最初にグローバル変数として定義
     sim_out = sim[["nav", "r_eq_jpy", "r_gold_jpy", "r_gross", "r_net"]].copy()
     sim_out.to_csv(out_csv, index=True, encoding="utf-8-sig")
     print(f"\nSaved simulation CSV: {out_csv}")
 
+    # 以下も評価ファイルを生成する場合
     # out_eval = DATA_DIR / "sim_vs_fund_eval.csv"
     # eval_df.to_csv(out_eval, index=True, encoding="utf-8-sig")
     # print(f"Saved evaluation CSV: {out_eval}")
