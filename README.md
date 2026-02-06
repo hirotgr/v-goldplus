@@ -17,10 +17,10 @@
 ![](./README-1.jpeg)
 
 ドットコムバブル崩壊での Max Drawdown -> https://hirotgr.github.io/jfunds-nav-chart/
-![](./README-1.jpeg)
+![](./README-2.jpeg)
 
 金融危機での Max Drawdown -> 同上
-![](./README-1.jpeg)
+![](./README-3.jpeg)
 
 まとめなど:
 
